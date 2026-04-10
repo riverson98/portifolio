@@ -63,6 +63,9 @@ export default function Navbar() {
         <button
           className="md:hidden text-slate-400 hover:text-white"
           onClick={() => setOpen(!open)}
+          aria-label={open ? "Fechar menu" : "Abrir menu"}
+          aria-expanded={open}
+          aria-controls="mobile-menu"
         >
           {open ? <X size={22} /> : <Menu size={22} />}
         </button>
@@ -70,7 +73,7 @@ export default function Navbar() {
 
       {/* Mobile menu */}
       {open && (
-        <div className="md:hidden bg-[#0f0f1a] border-t border-white/5 px-6 py-4 flex flex-col gap-4">
+        <div id="mobile-menu" className="md:hidden bg-[#0f0f1a] border-t border-white/5 px-6 py-4 flex flex-col gap-4">
           {links.map((l) => (
             <a
               key={l.href}

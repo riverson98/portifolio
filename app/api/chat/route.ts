@@ -1,5 +1,55 @@
 import { NextRequest } from "next/server";
 
+// ---------------------------------------------------------------------------
+// Rate limiting (C1) — in-memory, resets por janela de 1 minuto por IP
+// ---------------------------------------------------------------------------
+const rateLimitStore = new Map<string, { count: number; resetAt: number }>();
+
+const RATE_LIMIT_MAX = 10;      // máximo de requisições por janela
+const RATE_LIMIT_WINDOW = 60_000; // janela de 1 minuto em ms
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const record = rateLimitStore.get(ip);
+
+  if (!record || now >= record.resetAt) {
+    rateLimitStore.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
+    return true;
+  }
+
+  if (record.count >= RATE_LIMIT_MAX) {
+    return false;
+  }
+
+  record.count++;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Validação de mensagens (C2)
+// ---------------------------------------------------------------------------
+const MAX_MESSAGES = 20;
+const MAX_CHARS_PER_MESSAGE = 2000;
+
+type ChatMessage = { role: string; content: string };
+
+function validateMessages(messages: unknown): messages is ChatMessage[] {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  if (messages.length > MAX_MESSAGES) return false;
+
+  return messages.every(
+    (m) =>
+      m !== null &&
+      typeof m === "object" &&
+      typeof (m as ChatMessage).role === "string" &&
+      typeof (m as ChatMessage).content === "string" &&
+      (m as ChatMessage).content.length <= MAX_CHARS_PER_MESSAGE
+  );
+}
+
+// ---------------------------------------------------------------------------
+// System prompt
+// ---------------------------------------------------------------------------
 const SYSTEM_PROMPT = `Você é RIV-E, o assistente de IA pessoal do portfólio de Riverson Vicente. Você responde perguntas sobre a carreira, habilidades e desafios profissionais dele de forma clara, direta e com personalidade técnica.
 
 ## Sobre Riverson Vicente
@@ -45,35 +95,82 @@ const SYSTEM_PROMPT = `Você é RIV-E, o assistente de IA pessoal do portfólio 
 - Responda em português brasileiro por padrão, mas adapte ao idioma do usuário
 - Nunca invente informações que não estejam neste contexto`;
 
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
 export async function POST(req: NextRequest) {
-  const { messages } = await req.json();
+  // C1 — Rate limiting
+  const ip =
+    req.headers.get("x-forwarded-for")?.split(",")[0].trim() ?? "unknown";
 
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return Response.json({ error: "messages inválidas" }, { status: 400 });
+  if (!checkRateLimit(ip)) {
+    return Response.json(
+      { error: "Muitas perguntas em pouco tempo. Aguarde um momento." },
+      { status: 429 }
+    );
+  }
+
+  // C2 — Validação de payload
+  let body: unknown;
+  try {
+    body = await req.json();
+  } catch {
+    return Response.json({ error: "Payload inválido." }, { status: 400 });
+  }
+
+  const { messages } = body as { messages: unknown };
+
+  if (!validateMessages(messages)) {
+    return Response.json(
+      {
+        error:
+          "Mensagens inválidas. Verifique o formato, quantidade (máx. 20) e tamanho (máx. 2000 chars cada).",
+      },
+      { status: 400 }
+    );
   }
 
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
-    return Response.json({ error: "API key não configurada" }, { status: 500 });
+    console.error("OPENROUTER_API_KEY não está definida.");
+    return Response.json(
+      { error: "Serviço temporariamente indisponível." },
+      { status: 503 }
+    );
   }
 
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "HTTP-Referer": "https://riverson.dev",
-      "X-Title": "Riverson Vicente Portfolio",
-    },
-    body: JSON.stringify({
-      model: "openai/gpt-oss-120b:free",
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
-    }),
-  });
+  let response: Response;
+  try {
+    response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://riverson.dev",
+        "X-Title": "Riverson Vicente Portfolio",
+      },
+      body: JSON.stringify({
+        model: "openai/gpt-oss-120b:free",
+        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
+      }),
+    });
+  } catch (err) {
+    // C3 — Erro de rede: loga internamente, retorna mensagem genérica
+    console.error("Falha ao conectar ao OpenRouter:", err);
+    return Response.json(
+      { error: "Não foi possível processar sua pergunta. Tente novamente." },
+      { status: 502 }
+    );
+  }
 
   if (!response.ok) {
-    const error = await response.text();
-    return Response.json({ error }, { status: response.status });
+    // C3 — Erro da API: loga internamente, nunca expõe detalhe ao cliente
+    const raw = await response.text();
+    console.error(`OpenRouter respondeu ${response.status}:`, raw);
+    return Response.json(
+      { error: "Não foi possível processar sua pergunta. Tente novamente." },
+      { status: 500 }
+    );
   }
 
   const data = await response.json();
